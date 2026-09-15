@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Nama Akun 1",
+    "loginId": "username_atau_email",
+    "password": "password_akun",
+    "cookie": "auth_sid=COOKIE_DISINI; _ga=..."
+  },
+  {
+    "name": "Nama Akun 2",
+    "loginId": "username_atau_email_2",
+    "password": "password_akun_2",
+    "cookie": "auth_sid=COOKIE_DISINI; _ga=..."
+  }
+]

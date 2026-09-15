@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 /**
@@ -23,9 +23,11 @@ const CONFIG = {
   maxRetries: 3,
   retryDelayMs: 2000,
   delayBetweenAccountsMs: 1000,
+  sessionsFile: 'sessions.json',
   commonHeaders: {
     accept: '*/*',
     'accept-language': 'en,en-US;q=0.9,id;q=0.8',
+    origin: 'https://dyax.io',
     referer: 'https://dyax.io/en/profile',
     'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
     'sec-ch-ua-mobile': '?0',
@@ -41,6 +43,56 @@ const CONFIG = {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Baca sessions dari sessions.json
+ */
+function loadSessions() {
+  const jsonPath = resolve(process.cwd(), CONFIG.sessionsFile);
+
+  if (!existsSync(jsonPath)) {
+    console.error(`${c.red}File ${CONFIG.sessionsFile} tidak ditemukan!${c.reset}`);
+    console.error(`${c.gray}Buat file sessions.json berdasarkan sessions.example.json.${c.reset}\n`);
+    return [];
+  }
+
+  try {
+    const raw = readFileSync(jsonPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      console.error(`${c.red}File sessions.json kosong atau formatnya salah!${c.reset}\n`);
+      return [];
+    }
+
+    return parsed.map((item, index) => ({
+      name: item.name || `Akun #${index + 1}`,
+      loginId: item.loginId || '',
+      password: item.password || '',
+      cookie: item.cookie || '',
+    }));
+  } catch (err) {
+    console.error(`${c.red}Gagal membaca sessions.json: ${err.message}${c.reset}\n`);
+    return [];
+  }
+}
+
+/**
+ * Simpan cookie baru ke sessions.json (setelah re-login berhasil)
+ */
+function saveCookie(sessionIndex, newCookie) {
+  const jsonPath = resolve(process.cwd(), CONFIG.sessionsFile);
+  try {
+    const raw = readFileSync(jsonPath, 'utf-8');
+    const sessions = JSON.parse(raw);
+    if (sessions[sessionIndex]) {
+      sessions[sessionIndex].cookie = newCookie;
+      writeFileSync(jsonPath, JSON.stringify(sessions, null, 2), 'utf-8');
+    }
+  } catch {
+    // Abaikan jika gagal menyimpan
+  }
+}
+
+/**
  * Helper Fetch dengan Auto-Retry
  */
 async function fetchWithRetry(url, options, maxRetries = CONFIG.maxRetries, retryDelay = CONFIG.retryDelayMs) {
@@ -50,10 +102,10 @@ async function fetchWithRetry(url, options, maxRetries = CONFIG.maxRetries, retr
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => '');
-        throw new Error(`HTTP ${response.status}: ${errorText.slice(0, 50) || response.statusText}`);
+        throw new Error(`HTTP ${response.status}: ${errorText.slice(0, 80) || response.statusText}`);
       }
 
-      return await response.json();
+      return response;
     } catch (error) {
       if (attempt < maxRetries) {
         await sleep(retryDelay);
@@ -64,18 +116,67 @@ async function fetchWithRetry(url, options, maxRetries = CONFIG.maxRetries, retr
   }
 }
 
+/**
+ * Panggil API Dyax (GET) - mengembalikan JSON
+ */
 async function callDyaxApi(endpoint, cookie) {
-  return await fetchWithRetry(`${CONFIG.baseUrl}${endpoint}`, {
+  const res = await fetchWithRetry(`${CONFIG.baseUrl}${endpoint}`, {
     method: 'GET',
     headers: {
       ...CONFIG.commonHeaders,
       cookie: cookie,
     },
   });
+  return await res.json();
 }
 
 /**
- * Cek status Daily Login
+ * Login ulang menggunakan loginId + password
+ * Mengembalikan cookie auth_sid baru jika berhasil, atau null jika gagal
+ */
+async function reLogin(session) {
+  if (!session.loginId || !session.password) return null;
+
+  try {
+    const res = await fetchWithRetry(`${CONFIG.baseUrl}/api/auth/email/login`, {
+      method: 'POST',
+      headers: {
+        ...CONFIG.commonHeaders,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        loginId: session.loginId,
+        password: session.password,
+        remember: 'true',
+      }),
+    });
+
+    // Ambil Set-Cookie header untuk mendapatkan auth_sid baru
+    const setCookieHeader = res.headers.get('set-cookie');
+
+    if (setCookieHeader) {
+      // Parse auth_sid dari Set-Cookie header
+      const authSidMatch = setCookieHeader.match(/auth_sid=([^;]+)/);
+      if (authSidMatch) {
+        const newAuthSid = `auth_sid=${authSidMatch[1]}`;
+        return newAuthSid;
+      }
+    }
+
+    // Jika tidak ada Set-Cookie, coba ambil dari body response
+    const body = await res.json().catch(() => null);
+    if (body && body.error) {
+      throw new Error(body.error);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cek status Daily Login dari riwayat terbaru (index 0)
  */
 function checkDailyLoginStatus(recent = []) {
   if (!recent || recent.length === 0) {
@@ -100,40 +201,48 @@ function checkDailyLoginStatus(recent = []) {
 }
 
 /**
- * Baca sessions dari sessions.txt
+ * Proses satu akun: fetch data, jika gagal/expired coba re-login lalu retry
  */
-function loadSessions() {
-  const txtPath = resolve(process.cwd(), 'sessions.txt');
+async function processAccount(session, sessionIndex) {
+  let activeCookie = session.cookie;
+  let didReLogin = false;
 
-  if (existsSync(txtPath)) {
-    try {
-      const content = readFileSync(txtPath, 'utf-8');
-      const lines = content
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && !line.startsWith('#'));
+  // Fungsi untuk fetch 3 endpoint utama
+  const fetchAll = async (cookie) => {
+    const userMe = await callDyaxApi('/api/users/me', cookie);
+    const authUser = await callDyaxApi('/api/auth/user', cookie);
+    const dyaxData = await callDyaxApi('/api/users/me/dyax', cookie);
+    return { userMe, authUser, dyaxData };
+  };
 
-      if (lines.length > 0) {
-        return lines.map((line, index) => {
-          if (line.includes('|')) {
-            const [name, ...cookieParts] = line.split('|');
-            return {
-              name: name.trim() || `Akun #${index + 1}`,
-              cookie: cookieParts.join('|').trim(),
-            };
-          }
-          return {
-            name: `Akun #${index + 1}`,
-            cookie: line,
-          };
-        });
+  let data;
+  try {
+    // Percobaan pertama dengan cookie yang ada
+    data = await fetchAll(activeCookie);
+  } catch {
+    // Cookie mungkin expired, coba login ulang jika ada kredensial
+    if (!session.loginId || !session.password) {
+      throw new Error('Session expired (no credentials)');
+    }
+
+    const newCookie = await reLogin(session);
+
+    if (newCookie) {
+      activeCookie = newCookie;
+      didReLogin = true;
+      saveCookie(sessionIndex, newCookie);
+
+      try {
+        data = await fetchAll(activeCookie);
+      } catch (retryErr) {
+        throw new Error(`Re-login OK but fetch failed: ${retryErr.message}`);
       }
-    } catch (err) {
-      console.error(`Gagal membaca sessions.txt: ${err.message}`);
+    } else {
+      throw new Error('Session expired & re-login failed (wrong credentials?)');
     }
   }
 
-  return [];
+  return { ...data, didReLogin };
 }
 
 /**
@@ -154,12 +263,9 @@ async function main() {
 
   const sessions = loadSessions();
 
-  if (sessions.length === 0) {
-    console.log(`${c.red}File sessions.txt kosong atau belum diisi!${c.reset}\n`);
-    return;
-  }
+  if (sessions.length === 0) return;
 
-  // Header Kolom (Tanpa box-drawing yang mudah pecah/berantakan)
+  // Header kolom
   console.log(
     `  ${'#'.padEnd(3)} ${'AKUN'.padEnd(10)} ${'USERNAME'.padEnd(14)} ${'LV'.padEnd(5)} ${'POINTS'.padStart(8)}  ${'STATUS'.padEnd(14)} ${'CHECK-IN'}`
   );
@@ -177,9 +283,7 @@ async function main() {
     const akunStr = session.name.slice(0, 10).padEnd(10);
 
     try {
-      const userMe = await callDyaxApi('/api/users/me', session.cookie);
-      const authUser = await callDyaxApi('/api/auth/user', session.cookie);
-      const dyaxData = await callDyaxApi('/api/users/me/dyax', session.cookie);
+      const { userMe, authUser, dyaxData, didReLogin } = await processAccount(session, i);
 
       const status = checkDailyLoginStatus(dyaxData.recent);
       const username = (userMe.name || authUser.user?.firstName || 'User').slice(0, 14).padEnd(14);
@@ -187,7 +291,7 @@ async function main() {
       const rawPts = dyaxData.total ?? userMe.points ?? 0;
       const ptsFormatted = rawPts.toLocaleString('id-ID').padStart(8);
 
-      let statusText = '';
+      let statusText;
       if (status.isToday) {
         statusText = status.diffMinutes < 5
           ? `${c.green}✓ Baru Klaim  ${c.reset}`
@@ -196,15 +300,19 @@ async function main() {
         statusText = `${c.yellow}! Belum Klaim ${c.reset}`;
       }
 
+      const reLoginBadge = didReLogin ? ` ${c.yellow}↻ re-login${c.reset}` : '';
+
       console.log(
-        `  ${c.dim}${noStr}${c.reset}  ${akunStr} ${c.bold}${username}${c.reset} ${c.dim}${level}${c.reset} ${c.cyan}${ptsFormatted}${c.reset}  ${statusText} ${c.gray}${status.formattedDate}${c.reset}`
+        `  ${c.dim}${noStr}${c.reset}  ${akunStr} ${c.bold}${username}${c.reset} ${c.dim}${level}${c.reset} ${c.cyan}${ptsFormatted}${c.reset}  ${statusText} ${c.gray}${status.formattedDate}${c.reset}${reLoginBadge}`
       );
 
       successCount++;
       totalPoints += rawPts;
     } catch (err) {
+      const reason = err.message.includes('wrong credentials') ? 'creds salah' :
+                     err.message.includes('no credentials') ? 'no creds' : 'expired';
       console.log(
-        `  ${c.dim}${noStr}${c.reset}  ${akunStr} ${'-'.padEnd(14)} ${'-'.padEnd(5)} ${'-'.padStart(8)}  ${c.red}× Gagal/Exp   ${c.reset} ${c.gray}-${c.reset}`
+        `  ${c.dim}${noStr}${c.reset}  ${akunStr} ${'-'.padEnd(14)} ${'-'.padEnd(5)} ${'─'.repeat(8)}  ${c.red}× Gagal/Exp   ${c.reset} ${c.gray}${reason}${c.reset}`
       );
       failedCount++;
     }
@@ -214,6 +322,7 @@ async function main() {
     }
   }
 
+  // Footer
   console.log(
     `  ${'─'.repeat(3)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(5)} ${'─'.repeat(8)}  ${'─'.repeat(14)} ${'─'.repeat(14)}`
   );
